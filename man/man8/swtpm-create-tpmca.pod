@@ -90,6 +90,9 @@ into /var/lib/swtpm-localca and the swtpm-localca configuration to
 /etc/swtpm-localca.conf. It can then be used for signing certificates of
 newly created B<swtpm> TPMs.
 
+If the host's TPM is a TPM 1.2, we need to start the tcsd first and can
+then create the TPM key and TPM CA certificate:
+
  #> sudo systemctl start tcsd
  #> sudo /usr/share/swtpm/swtpm-create-tpmca \
 		--dir /var/lib/swtpm-localca \
@@ -106,6 +109,31 @@ newly created B<swtpm> TPMs.
  TSS_TCSD_PORT = 30003
  signingkey_password = password
  parentkey_password = password
+
+
+Alternatively, if the host's TPM is a TPM 2 and Intel's TPM 2 stack is
+installed, we need to start tpm2-abrmd first and can then create the TPM key
+and TPM CA certificate:
+
+ #> sudo systemctl start tpm2-abrmd
+ #> sudo /usr/share/swtpm/swtpm-create-tpmca \
+		--dir /var/lib/swtpm-localca \
+		--overwrite \
+		--outfile /etc/swtpm-localca.conf \
+		--group tss \
+		--tpm2
+ statedir = /var/lib/swtpm-localca
+ signingkey = pkcs11:model=TPM2%20PKCS%2311\;manufacturer=Intel\;serial=0000000000000000\;token=swtpm-tpmca\;id=%38%39%63%33%34%34%65%62%64%34%37%39%33%62%30%61\;object=swtpm-tpmca-key\;type=private
+ issuercert = /var/lib/swtpm-localca/swtpm-localca-tpmca-cert.pem
+ certserial = /var/lib/swtpm-localca/certserial
+
+To test either one of the above TPM CAs, run the following command:
+
+ #> /usr/share/swtpm/swtpm-localca \
+	--type ek --ek x=11,y=13 \
+	--dir /tmp --vmid test --tpm2 \
+	--tpm-spec-family 2.0 --tpm-spec-revision 146 --tpm-spec-level 00 \
+	--tpm-model swtpm --tpm-version 20170101 --tpm-manufacturer IBM
 
 =head1 KNOWN ISSUES
 

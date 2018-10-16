@@ -2,6 +2,7 @@
 
 FLAG_OVERWRITE=1
 FLAG_REGISTER_KEY=2
+FLAG_TPM2=4
 
 TSS_TCSD_HOSTNAME_DEFAULT=localhost
 TSS_TCSD_PORT_DEFAULT=30003
@@ -35,6 +36,14 @@ function get_filesize()
 		# OpenBSD
 		stat -f%z $1
 	fi
+}
+
+# Create a config value by escaping the proper characters
+#
+# @param 1: The string to escape
+function escape_gnutls_url()
+{
+	echo "$1" | sed 's/;/\\;/g'
 }
 
 # Use expect for automating the interaction with the tpmtool
@@ -121,45 +130,112 @@ create_localca_cert() {
 
 	rm -f ${tpmkey} ${tpmpubkey} ${tpmca}
 
-	if [ $((flags & FLAG_REGISTER_KEY)) -ne 0 ]; then
-		msg="$(run_tpmtool --generate-rsa --signing --register)"
-		if [ $? -ne 0 ]; then
-			logerr "Could not generate registered signing key with tpmtool"
-			logerr "${msg}"
-			return 1
+	if [ $((flags & FLAG_TPM2)) -ne 0 ]; then
+		local tokenurl tpmkeyurl
+		local token="swtpm-tpmca"
+		local label="swtpm-tpmca"
+		local keylabel="swtpm-tpmca-key"
+		local userpin="swtpm-tpmca"
+		local sopin="swtpm-tpmca"
+
+		tokenurl=$(p11tool --list-tokens  | \
+				grep "token=${token}" | \
+				sed -n "s/.*URL: //p" 2>&1)
+		if [ -z "${tokenurl}" ]; then
+			msg=$(tpm2_ptool.py addtoken \
+				--pid 1 \
+				--sopin=${sopin} \
+				--userpin=${userpin} \
+				--label=${label} 2>&1)
+			if [ $? -ne 0 ]; then
+				logerr "Error: Could not create pkcs11 token"
+				logerr "${msg}"
+				return 1
+			fi
+			tokenurl=$(p11tool --list-tokens  | \
+					grep ";token=${token}" | \
+					sed -n "s/.*URL: //p" 2>&1)
+			if [ -z "${tokenurl}" ]; then
+				logerr "Error: Could not get token URL for token '${token}'"
+				logerr "${msg}"
+			fi
 		fi
-		tpmkeyurl=$(echo "${msg}" | sed -n 's/\(tpmkey:uuid=[^;]*\);.*/\1/p')
+
+		tpmkeyurl=$(p11tool --list-keys ${tokenurl} | \
+				grep ";object=${keylabel}" | \
+				sed -n "s/.*URL: //p" 2>&1)
 		if [ -z "${tpmkeyurl}" ]; then
-			logerr "Could not parse tpmkey URL"
+			msg=$(tpm2_ptool.py addkey \
+				--label=${label} \
+				--userpin=${userpin} \
+				--algorithm=rsa2048 \
+				--key-label=${keylabel} \
+				--id 1)
+			if [ $? -ne 0 ]; then
+				logerr "Error: Could not create create key under pkcs11 token ${token}"
+				logerr "${msg}"
+				return 1
+			fi
+			tpmkeyurl=$(p11tool --list-keys ${tokenurl} | \
+					grep ";object=${keylabel}" | \
+					sed -n "s/.*URL: //p")
+			if [ -z "${tpmkeyurl}" ]; then
+				logerr "Error: Could not get TPM key URL for ${tokenurl}"
+				logerr "${msg}"
+				return 1
+			fi
+		fi
+		rm -f "${tpmpubkey}"
+
+		msg=$(p11tool --export-pubkey ${tpmkeyurl} --login --outfile ${tpmpubkey})
+		if [ $? -ne 0 ] || \
+		   [ ! -r ${tpmpubkey} ] || [ $(get_filesize "${tpmpubkey}") -eq 0 ]; then
+			logerr "Error: Could not get TPM public key"
 			logerr "${msg}"
+			rm -f "${tpmkey}" "${tpmpubkey}"
 			return 1
 		fi
 	else
-		rm -f "${tpmkey}"
-		msg="$(run_tpmtool --generate-rsa --signing --outfile "${tpmkey}")"
-		if [ $? -ne 0 ]; then
-			logerr "Could not create signing key with tpmtool"
-			logerr "${msg}"
+		if [ $((flags & FLAG_REGISTER_KEY)) -ne 0 ]; then
+			msg="$(run_tpmtool --generate-rsa --signing --register)"
+			if [ $? -ne 0 ]; then
+				logerr "Could not generate registered signing key with tpmtool"
+				logerr "${msg}"
+				return 1
+			fi
+			tpmkeyurl=$(echo "${msg}" | sed -n 's/\(tpmkey:uuid=[^;]*\);.*/\1/p')
+			if [ -z "${tpmkeyurl}" ]; then
+				logerr "Could not parse tpmkey URL"
+				logerr "${msg}"
+				return 1
+			fi
+		else
 			rm -f "${tpmkey}"
-			return 1
+			msg="$(run_tpmtool --generate-rsa --signing --outfile "${tpmkey}")"
+			if [ $? -ne 0 ]; then
+				logerr "Could not create signing key with tpmtool"
+				logerr "${msg}"
+				rm -f "${tpmkey}"
+				return 1
+			fi
+			if [ ! -r "${tpmkey}" ] || [ $(get_filesize "${tpmkey}") -eq 0 ]; then
+				logerr "The TPM key file ${tpmkey} was not written properly"
+				rm -f "${tpmkey}"
+				return 1
+			fi
+			chmod 640 ${tpmkey}
+			tpmkeyurl=tpmkey:file=${tpmkey}
 		fi
-		if [ ! -r "${tpmkey}" ] || [ $(get_filesize "${tpmkey}") -eq 0 ]; then
-			logerr "The TPM key file ${tpmkey} was not written properly"
-			rm -f "${tpmkey}"
-			return 1
-		fi
-		chmod 640 ${tpmkey}
-		tpmkeyurl=tpmkey:file=${tpmkey}
-	fi
 
-	rm -f "${tpmpubkey}"
-	msg=$(run_tpmtool --pubkey=${tpmkeyurl} --outfile "${tpmpubkey}")
-	if [ $? -ne 0 ] || \
-           [ ! -r ${tpmpubkey} ] || [ $(get_filesize "${tpmpubkey}") -eq 0 ]; then
-		logerr "Error: Could not get TPM public key"
-		logerr "${msg}"
-		rm -f "${tpmkey}" "${tpmpubkey}"
-		return 1
+		rm -f "${tpmpubkey}"
+		msg=$(run_tpmtool --pubkey=${tpmkeyurl} --outfile "${tpmpubkey}")
+		if [ $? -ne 0 ] || \
+		   [ ! -r ${tpmpubkey} ] || [ $(get_filesize "${tpmpubkey}") -eq 0 ]; then
+			logerr "Error: Could not get TPM public key"
+			logerr "${msg}"
+			rm -f "${tpmkey}" "${tpmpubkey}"
+			return 1
+		fi
 	fi
 
 	echo "cn=swtpm-localca" > ${template}
@@ -185,12 +261,14 @@ create_localca_cert() {
 	fi
 
 	output="statedir = ${dir}
-signingkey = ${tpmkeyurl}
+signingkey = $(escape_gnutls_url ${tpmkeyurl})
 issuercert = ${tpmca}
-certserial = ${dir}/certserial
-TSS_TCSD_HOSTNAME = ${TSS_TCSD_HOSTNAME}
-TSS_TCSD_PORT = ${TSS_TCSD_PORT}"
+certserial = ${dir}/certserial"
 
+	if [ $((flags & FLAG_TPM2)) -eq 0 ]; then
+		output+="$(echo -e "\nTSS_TCSD_HOSTNAME = ${TSS_TCSD_HOSTNAME}")"
+		output+="$(echo -e "\nTSS_TCSD_PORT = ${TSS_TCSD_PORT}")"
+	fi
 	if [ -n "${TPM_KEY_PASSWORD}" ]; then
 		output+="$(echo -e "\nsigningkey_password = ${TPM_KEY_PASSWORD}")"
 	fi
@@ -236,7 +314,8 @@ The following options are supported:
 --overwrite        Overwrite any data in an existing directory; tries to
                    reuse a root CA if one is found there
 --register         Create a registered TPM 1.2 key rather than a file that
-                   contains the key
+                   contains the key; this option has no effect if --tpm2 is
+                   used
 --key-password s   Password for the newly created TPM key; required if
                    --register is not passed
                    Note: use the same as the --srk-password (bug in certtool)
@@ -254,6 +333,7 @@ The following options are supported:
                    on; default is '${TSS_TCSD_HOSTNAME_DEFAULT}'
 --tss-tcsd-port p  The TCP port on which tcsd is listening for connections;
                    default is ${TSS_TCSD_PORT_DEFAULT}
+--tpm2             Setup a CA that uses a TPM2 rather than a TPM 1.2
 --help, -h, -?     Display this help screen and exit
 
 
@@ -308,6 +388,9 @@ main() {
 			shift
 			TSS_TCSD_PORT="$2"
 			;;
+		--tpm2)
+			flags=$((flags | FLAG_TPM2))
+			;;
 		--help|-h|-?)
 			usage "$0"
 			exit 0
@@ -331,7 +414,9 @@ main() {
 		return 1
 	fi
 
-	if [ -z "${TPM_KEY_PASSWORD}" ] && [ $((flags & FLAG_REGISTER_KEY)) -eq 0 ]; then
+	if [ -z "${TPM_KEY_PASSWORD}" ] && \
+	   [ $((flags & FLAG_REGISTER_KEY)) -eq 0 ] && \
+	   [ $((flags & FLAG_TPM2)) -eq 0 ]; then
 		logerr "Key password is required"
 		return 1
 	fi
