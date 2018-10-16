@@ -852,7 +852,7 @@ main(int argc, char *argv[])
     gnutls_x509_privkey_t sigkey = NULL;
     gnutls_x509_crt_t sigcert = NULL;
     gnutls_x509_crt_t crt = NULL;
-    gnutls_privkey_t tpmkey = NULL;
+    gnutls_privkey_t tpmkey = NULL, pkcs11key = NULL;
     const char *pubkey_filename = NULL;
     const char *sigkey_filename = NULL;
     const char *cert_filename = NULL;
@@ -1257,6 +1257,14 @@ if (_err != GNUTLS_E_SUCCESS) {             \
                                             parentkeypass, sigkeypass, 0);
         CHECK_GNUTLS_ERROR(err, "Could not import tpmkey %s: %s\n",
                            sigkey_filename, gnutls_strerror(err));
+    } else if (strstr(sigkey_filename, "pkcs11:") == sigkey_filename) {
+        /* GnuTLS PKCS11 key URL */
+        err = gnutls_privkey_init(&pkcs11key);
+        CHECK_GNUTLS_ERROR(err, "Could not initialize tpmkey: %s\n",
+                           gnutls_strerror(err));
+        err = gnutls_privkey_import_url(pkcs11key, sigkey_filename, 0);
+        CHECK_GNUTLS_ERROR(err, "Could not import pkcs11 key %s: %s\n",
+                           sigkey_filename, gnutls_strerror(err));
     } else {
         err = gnutls_x509_privkey_init(&sigkey);
         CHECK_GNUTLS_ERROR(err, "Could not initialize sigkey: %s\n",
@@ -1541,6 +1549,9 @@ if (_err != GNUTLS_E_SUCCESS) {             \
     /* sign cert */
     if (sigkey) {
         err = gnutls_x509_crt_sign2(crt, sigcert, sigkey, hashAlgo, 0);
+    } else if (pkcs11key) {
+        err = gnutls_x509_crt_privkey_sign(crt, sigcert, pkcs11key,
+                                           hashAlgo, 0);
     } else {
         /* TPM 1.2 signs cert */
         err = gnutls_x509_crt_privkey_sign(crt, sigcert, tpmkey,
@@ -1601,6 +1612,7 @@ cleanup:
     gnutls_x509_privkey_deinit(sigkey);
     gnutls_pubkey_deinit(pubkey);
     gnutls_privkey_deinit(tpmkey);
+    gnutls_privkey_deinit(pkcs11key);
 
     gnutls_global_deinit();
 
